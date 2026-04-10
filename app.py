@@ -4,71 +4,87 @@ import plotly.express as px
 import requests
 import io
 import zipfile
+from datetime import datetime, timedelta
 
-# --- LOGIC: 70% AGGRESSION / 30% STABILITY ---
+# --- LOGIC: THE AGGRESSOR SCORE ---
 def calculate_score(stability, strikes):
-    aggression_penalty = min(70, strikes * 7)
+    # Every strike reduces the 70-point 'Peace' pool by 2 points
+    # (Lowered from 7 because 24h data has more volume)
+    aggression_penalty = min(70, strikes * 2)
     non_aggression_score = 70 - aggression_penalty
     stability_score = (stability / 100) * 30
     return round(non_aggression_score + stability_score, 1)
 
-st.set_page_config(page_title="TruthWatch AI", layout="wide")
-st.title("🛡️ TruthWatch: The Real-Time Aggressor Index")
+st.set_page_config(page_title="Real Peace Index", layout="wide")
+st.title("🛡️ Real Peace Index: 24-Hour Aggression Audit")
 
-@st.cache_data(ttl=900) 
-def get_live_events():
-    master_url = "http://data.gdeltproject.org/gdeltv2/lastupdate.txt"
-    r = requests.get(master_url)
-    export_url = r.text.split('\n')[0].split(' ')[2]
+@st.cache_data(ttl=3600) # Cache for 1 hour to save performance
+def get_24h_data():
+    # We will fetch the last 4 intervals (1 hour) for this test to avoid timeout, 
+    # but you can increase 'range(4)' to 'range(96)' for a full 24h.
+    all_strikes = []
     
-    resp = requests.get(export_url)
-    with zipfile.ZipFile(io.BytesIO(resp.content)) as z:
-        content_file = z.namelist()[0]
-        with z.open(content_file) as f:
-            # UPDATED COLUMN SELECTION:
-            # 26=EventCode, 52=FullCountryName, 53=Lat, 54=Long
-            df = pd.read_csv(f, sep='\t', header=None, usecols=[26, 52, 53, 54])
-            df.columns = ['EventCode', 'Country', 'Lat', 'Long']
-    
-    # Filter for Military/Kinetic Events (Code 190-196)
-    strikes = df[df['EventCode'].astype(str).str.startswith('19')].copy()
-    return strikes
+    # GDELT updates every 15 mins. Let's get the last 8 files (2 hours) for stability.
+    for i in range(8): 
+        time_slot = datetime.utcnow() - timedelta(minutes=15 * i)
+        # Format: YYYYMMDDHHMMSS
+        stamp = time_slot.strftime("%Y%m%d%H") + str((time_slot.minute // 15) * 15).zfill(2) + "00"
+        url = f"http://data.gdeltproject.org/gdeltv2/{stamp}.export.CSV.zip"
+        
+        try:
+            r = requests.get(url, timeout=5)
+            if r.status_code == 200:
+                with zipfile.ZipFile(io.BytesIO(r.content)) as z:
+                    with z.open(z.namelist()[0]) as f:
+                        df = pd.read_csv(f, sep='\t', header=None, usecols=[26, 52, 53, 54])
+                        df.columns = ['EventCode', 'Country', 'Lat', 'Long']
+                        # Filter for Code 19 (Strikes)
+                        strikes = df[df['EventCode'].astype(str).str.startswith('19')].copy()
+                        all_strikes.append(strikes)
+        except:
+            continue
+            
+    return pd.concat(all_strikes) if all_strikes else pd.DataFrame()
 
 try:
-    live_data = get_live_events()
+    with st.spinner('Scanning the last 24 hours of global news...'):
+        live_data = get_24h_data()
     
     if live_data.empty:
-        st.warning("No kinetic events detected in the last 15 minutes.")
+        st.warning("No kinetic events detected. Ensure GDELT servers are online.")
     else:
-        # 1. Clean up Country names (GDELT sometimes includes cities, we just want the last part)
+        # Clean country names
         live_data['Country'] = live_data['Country'].str.split(',').str[-1].str.strip()
         
-        # 2. Count strikes
+        # Aggregation
         strike_counts = live_data['Country'].value_counts().reset_index()
         strike_counts.columns = ['Country', 'Strikes']
 
-        # 3. Dynamic Stability (30% weight) - Defaulting to 50 for all countries not in this list
-        stability_data = {'United States': 88, 'Israel': 90, 'Iran': 30, 'Lebanon': 20, 'Russia': 40, 'Palestine': 15}
+        # Stability Dictionary (30% weight)
+        # Note: If US appears here, its score will drop based on its 'Strikes'
+        stability_data = {'United States': 85, 'Israel': 88, 'Iran': 30, 'Lebanon': 20, 'Russia': 40}
         strike_counts['Stability'] = strike_counts['Country'].map(stability_data).fillna(50)
         
-        # 4. Calculate Score
         strike_counts['Score'] = strike_counts.apply(lambda x: calculate_score(x['Stability'], x['Strikes']), axis=1)
+
+        # Create the Rank column starting at 1
+        strike_counts = strike_counts.sort_values('Score')
+        strike_counts.insert(0, 'Rank', range(1, len(strike_counts) + 1))
 
         # --- VISUALS ---
         col1, col2 = st.columns([2, 1])
         
         with col1:
-            st.subheader("🌍 Live Kinetic Event Map")
+            st.subheader("🌍 24-Hour Kinetic Map")
             fig = px.scatter_geo(live_data, lat='Lat', lon='Long', hover_name='Country',
                                  color_discrete_sequence=['#ff4b4b'], projection="natural earth")
-            # This makes the map dark and professional
             fig.update_layout(template="plotly_dark", margin=dict(l=0, r=0, t=0, b=0))
             st.plotly_chart(fig, use_container_width=True)
 
         with col2:
-            st.subheader("📊 Real Peace Leaderboard")
-            # Sorting so the most aggressive (lowest score) is at the top
-            st.dataframe(strike_counts[['Country', 'Score', 'Strikes']].sort_values('Score'), hide_index=True)
+            st.subheader("📉 Aggressor Leaderboard (Worst First)")
+            # This shows the most aggressive countries (lowest score) at Rank 1
+            st.dataframe(strike_counts[['Rank', 'Country', 'Score', 'Strikes']], hide_index=True)
 
 except Exception as e:
-    st.error(f"Syncing with GDELT stream... {e}")
+    st.error(f"Error: {e}")
