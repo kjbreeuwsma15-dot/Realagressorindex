@@ -5,11 +5,8 @@ import io
 import zipfile
 from datetime import datetime, timedelta
 
-# --- 1. CONFIG & STYLE ---
+# 1. PAGE SETUP
 st.set_page_config(page_title="Real Peace Index", layout="wide")
-
-# Custom CSS to make the map container stand out
-st.markdown("<style> .stMap { border: 2px solid #ff4b4b; border-radius: 10px; } </style>", unsafe_allow_html=True)
 
 def calculate_score(stability, strikes):
     try:
@@ -19,30 +16,29 @@ def calculate_score(stability, strikes):
 
 st.title("🛡️ Real Peace Index: 24h Aggression Audit")
 
-# --- 2. THE RESILIENT DATA ENGINE ---
-@st.cache_data(ttl=600) # Faster refresh (10 mins)
+# 2. THE RESILIENT DATA ENGINE
+@st.cache_data(ttl=600)
 def get_audit_data():
     all_rows = []
-    # We scan the last 24 hours (96 slots)
-    # If a slot is empty or missing, we skip it and move to the next
+    # We attempt a 24h window but prioritize successfully downloaded chunks
+    # This prevents the 'Failed Data Grab' message
     for i in range(96):
-        t = datetime.utcnow() - timedelta(minutes=15 * i) - timedelta(minutes=10)
+        t = datetime.utcnow() - timedelta(minutes=15 * i) - timedelta(minutes=15)
         stamp = t.strftime("%Y%m%d%H") + str((t.minute // 15) * 15).zfill(2) + "00"
         url = f"http://data.gdeltproject.org/gdeltv2/{stamp}.export.CSV.zip"
         
         try:
-            r = requests.get(url, timeout=2)
+            # Increased timeout to 5 seconds to handle 2026 server congestion
+            r = requests.get(url, timeout=5)
             if r.status_code == 200:
                 with zipfile.ZipFile(io.BytesIO(r.content)) as z:
                     with z.open(z.namelist()[0]) as f:
-                        # Use raw index to avoid column name errors
                         df = pd.read_csv(f, sep='\t', header=None, low_memory=False, usecols=[26, 52, 53, 54])
-                        # Filter for Event Code 19 (Kinetic)
                         strikes = df[df[26].astype(str).str.startswith('19')].copy()
                         all_rows.append(strikes)
-            # Stop if we have enough data (Performance optimization)
-            if len(all_rows) > 50: break 
-        except: continue
+        except: 
+            # If a file fails, we just keep going instead of crashing
+            continue
             
     if not all_rows: return pd.DataFrame()
     
@@ -52,15 +48,18 @@ def get_audit_data():
     full_df['lon'] = pd.to_numeric(full_df['lon'], errors='coerce')
     return full_df.dropna(subset=['lat', 'lon'])
 
-# --- 3. THE UI ---
+# 3. DISPLAY LOGIC
 try:
-    with st.spinner("🔄 Re-syncing with global satellites..."):
+    # Use a cleaner loading message
+    with st.status("📡 Connecting to Global Satellite Feeds...", expanded=True) as status:
         data = get_audit_data()
+        if not data.empty:
+            status.update(label="✅ Data Audit Complete!", state="complete", expanded=False)
     
     if data.empty:
-        st.error("🚨 Critical Data Gap: GDELT satellite feed is currently dark. Retrying in 5 mins...")
+        st.error("⚠️ The Truth Stream is currently blocked. GDELT's servers are not responding. Try refreshing in 2 minutes.")
     else:
-        # Clean data for Leaderboard
+        # Leaderboard Processing
         data['Country'] = data['Country'].str.split(',').str[-1].str.strip()
         counts = data['Country'].value_counts().reset_index()
         counts.columns = ['Country', 'Strikes']
@@ -69,25 +68,19 @@ try:
         counts['Stability'] = counts['Country'].map(stability_map).fillna(50)
         counts['Score'] = counts.apply(lambda x: calculate_score(x['Stability'], x['Strikes']), axis=1)
         
-        # Rankings (Worst Actor = Rank 1)
         counts = counts.sort_values('Score').reset_index(drop=True)
         counts.insert(0, 'Rank', range(1, len(counts) + 1))
-
-        # SIDEBAR SEARCH (The "Clickable" replacement)
-        st.sidebar.title("🔍 Target Audit")
-        search = st.sidebar.selectbox("Focus on a specific aggressor:", ["Global Overview"] + list(counts['Country'].unique()))
 
         col1, col2 = st.columns([2, 1])
         
         with col1:
-            st.subheader(f"📍 Impact Zones: {search}")
-            map_data = data if search == "Global Overview" else data[data['Country'] == search]
-            # FORCE DISPLAY: st.map is the most reliable tool to show points
-            st.map(map_data[['lat', 'lon']], color='#FF0000', size=25) 
+            st.subheader("📍 Kinetic Impact Map")
+            # This map WILL show as long as even one file was grabbed
+            st.map(data[['lat', 'lon']], color='#FF0000', size=25) 
             
         with col2:
             st.subheader("📉 Aggressor Leaderboard")
             st.dataframe(counts[['Rank', 'Country', 'Score', 'Strikes']], hide_index=True, use_container_width=True)
 
 except Exception as e:
-    st.error(f"Audit System Failure: {e}")
+    st.error(f"Audit System Offline: {e}")
