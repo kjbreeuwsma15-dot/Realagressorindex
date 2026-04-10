@@ -1,23 +1,31 @@
-import streamlit as st
 import pandas as pd
-import plotly.express as px
 import requests
 import io
 import zipfile
 from datetime import datetime, timedelta
 
-# --- METHODOLOGY SIDEBAR ---
-with st.sidebar:
-    st.title("🛡️ Methodology")
-    st.markdown("70% Non-Aggression / 30% Stability")
-    st.info("Dots show verified kinetic strikes. Larger dots = multiple strikes.")
+# --- 1. TYPE-SAFE SCORE LOGIC ---
+def calculate_score(stability, strikes):
+    try:
+        # Force numeric conversion just in case
+        s_count = float(strikes)
+        stab_val = float(stability)
+        
+        aggression_penalty = min(70.0, s_count * 2.5)
+        non_aggression_score = 70.0 - aggression_penalty
+        stability_score = (stab_val / 100.0) * 30.0
+        return round(non_aggression_score + stability_score, 1)
+    except:
+        return 50.0 # Fallback for corrupted data
 
+st.set_page_config(page_title="Real Peace Index", layout="wide")
 st.title("🛡️ Real Peace Index: 24h Aggression Audit")
 
+# --- 2. DATA INGESTION ---
 @st.cache_data(ttl=900)
-def get_24h_data():
-    all_data = []
-    # Check the last 8 updates (2 hours)
+def get_verified_data():
+    all_rows = []
+    # Scanning last 8 updates
     for i in range(8):
         t = datetime.utcnow() - timedelta(minutes=15 * i)
         stamp = t.strftime("%Y%m%d%H") + str((t.minute // 15) * 15).zfill(2) + "00"
@@ -27,48 +35,57 @@ def get_24h_data():
             if r.status_code == 200:
                 with zipfile.ZipFile(io.BytesIO(r.content)) as z:
                     with z.open(z.namelist()[0]) as f:
-                        # Fetching: 26=EventCode, 52=GeoName, 53=Lat, 54=Long
-                        df = pd.read_csv(f, sep='\t', header=None, low_memory=False)
-                        # Filter Code 19 (Strikes)
+                        # Grab EventCode(26), Name(52), Lat(53), Long(54)
+                        df = pd.read_csv(f, sep='\t', header=None, low_memory=False, usecols=[26, 52, 53, 54])
+                        # Filter for Code 19 (Strikes)
                         strikes = df[df[26].astype(str).str.startswith('19')].copy()
-                        # Select only the columns we need: Name, Lat, Long
-                        strikes = strikes[[52, 53, 54]].dropna()
-                        strikes.columns = ['Country', 'lat', 'lon'] # lowercase for st.map
-                        all_data.append(strikes)
+                        all_rows.append(strikes)
         except: continue
-    return pd.concat(all_data) if all_data else pd.DataFrame()
-
-try:
-    df = get_24h_data()
     
-    if df.empty:
-        st.warning("No kinetic events found in the current 24h window.")
+    if not all_rows: return pd.DataFrame()
+    
+    full_df = pd.concat(all_rows)
+    full_df.columns = ['Code', 'Country', 'lat', 'lon']
+    # CRITICAL: Convert coords to numbers and drop anything that isn't a coordinate
+    full_df['lat'] = pd.to_numeric(full_df['lat'], errors='coerce')
+    full_df['lon'] = pd.to_numeric(full_df['lon'], errors='coerce')
+    return full_df.dropna(subset=['lat', 'lon'])
+
+# --- 3. DASHBOARD ---
+try:
+    data = get_verified_data()
+    
+    if data.empty:
+        st.warning("Scanning GDELT satellite feeds... No new kinetic events reported in the last hour.")
     else:
         # Clean Country Names
-        df['Country'] = df['Country'].str.split(',').str[-1].str.strip()
+        data['Country'] = data['Country'].str.split(',').str[-1].str.strip()
         
-        # --- THE LEADERBOARD ---
-        counts = df['Country'].value_counts().reset_index()
+        # Leaderboard
+        counts = data['Country'].value_counts().reset_index()
         counts.columns = ['Country', 'Strikes']
         
-        # Stability Scoring
-        stability = {'United States': 85, 'Israel': 90, 'Russia': 40, 'Iran': 30, 'Lebanon': 20}
-        counts['Stability'] = counts['Country'].map(stability).fillna(50)
-        counts['Score'] = counts.apply(lambda x: round(((70 - min(70, x['Strikes']*2.5)) + (x['Stability']*0.3)), 1), axis=1)
+        # Manual Stability Map
+        stability_map = {'United States': 85, 'Israel': 90, 'Russia': 40, 'Iran': 30, 'Lebanon': 20}
+        counts['Stability'] = counts['Country'].map(stability_map).fillna(50)
+        
+        # Calculate Scores
+        counts['Score'] = counts.apply(lambda x: calculate_score(x['Stability'], x['Strikes']), axis=1)
         counts = counts.sort_values('Score').reset_index(drop=True)
         counts.insert(0, 'Rank', range(1, len(counts) + 1))
 
-        # --- THE VISUALS ---
         col1, col2 = st.columns([2, 1])
-
         with col1:
             st.subheader("📍 Verified Impact Sites")
-            # We use st.map for guaranteed dot visibility on all browsers
-            st.map(df, color='#FF0000', size=20) 
+            # The red dots will appear here
+            st.map(data[['lat', 'lon']], color='#FF0000', zoom=1)
             
         with col2:
-            st.subheader("📉 Aggressor List")
+            st.subheader("📉 Aggressor List (Worst First)")
             st.dataframe(counts[['Rank', 'Country', 'Score', 'Strikes']], hide_index=True)
 
 except Exception as e:
-    st.error(f"Syncing with GDELT... {e}")
+    st.error(f"Syncing... If error persists, GDELT may be updating. Details: {e}")
+
+with st.expander("Methodology & Score Explanation"):
+    st.write("Score is 70% Non-Aggression and 30% Stability. Rank #1 is the country with the most outward kinetic events.")
